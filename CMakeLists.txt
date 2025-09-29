@@ -1,4 +1,4 @@
-option(TRITON_SHARED_BUILD_CPU_BACKEND "Build triton-shared CPU backend" ON)
+git config --unset pull.rebaseoption(TRITON_SHARED_BUILD_CPU_BACKEND "Build triton-shared CPU backend" ON)
 
 set(TRITON_SHARED_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 set(TRITON_SHARED_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}")
