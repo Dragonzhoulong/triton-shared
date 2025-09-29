@@ -1,154 +1,159 @@
+# ==========================================
+# Triton GEMM Alpha/Beta with MLIR Dump
+# ==========================================
+import os
+import time
 import torch
 import triton
 import triton.language as tl
-import pytest
-import benchmark
-
 from triton.backends.triton_shared.driver import CPUDriver
+import triton.runtime.driver
+
+# -----------------------------
+# MLIR / LLVM Dump Setup
+# -----------------------------
+os.environ['MLIR_ENABLE_DUMP'] = '1'  # 或者 'kernelName' 指定 kernel
+os.environ['MLIR_DUMP_PATH'] = './triton_mlir_dumps'
+os.environ['LLVM_IR_ENABLE_DUMP'] = '1'
+# 可选：解释器模式
+# os.environ['TRITON_INTERPRET'] = '1'
+
+# 切换到自定义 CPUDriver（新硬件 backend）
 triton.runtime.driver.set_active(CPUDriver())
-device = torch.device("cpu")
+device = torch.device("cpu")  # 前端测试用，不依赖 CUDA
 
-
+# -----------------------------
+# Triton GEMM kernel
+# -----------------------------
 @triton.jit
 def gemm_kernel(
-    A, B, C,
+    A_ptr, B_ptr, C_ptr,
     M, N, K,
     stride_am, stride_ak,
-    stride_bk, stride_bn, 
+    stride_bk, stride_bn,
     stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr,
-    BLOCK_SIZE_N: tl.constexpr, 
-    BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
+    alpha, beta,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
-    """General Matrix Multiplication (GEMM) kernel
-    
-    Computes C = A @ B where A is (M, K), B is (K, N), C is (M, N)
-    """
-    pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+    # 初始化 accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
-        accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-    
-    c = accumulator.to(tl.float32)
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
-    tl.store(c_ptrs, c, mask=c_mask)
+    for k0 in range(0, K, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        a = tl.load(A_ptr + offs_m[:, None]*stride_am + offs_k[None, :]*stride_ak,
+                    mask=(offs_m[:, None] < M) & (offs_k[None, :] < K))
+        b = tl.load(B_ptr + offs_k[:, None]*stride_bk + offs_n[None, :]*stride_bn,
+                    mask=(offs_k[:, None] < K) & (offs_n[None, :] < N))
+        acc += tl.dot(a, b)
 
+    c = tl.load(C_ptr + offs_m[:, None]*stride_cm + offs_n[None, :]*stride_cn,
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+    acc = alpha * acc + beta * c
+    tl.store(C_ptr + offs_m[:, None]*stride_cm + offs_n[None, :]*stride_cn,
+             acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
-def gemm(a, b):
-    """General Matrix Multiplication"""
-    assert a.shape[1] == b.shape[0], "Incompatible dimensions"
-    assert a.is_contiguous(), "Matrix A must be contiguous"  
-    assert b.is_contiguous(), "Matrix B must be contiguous"
-    
-    M, K = a.shape
-    K, N = b.shape
-    c = torch.empty((M, N), device=a.device, dtype=a.dtype)
-    
-    grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),)
+# -----------------------------
+# Python wrapper
+# -----------------------------
+def triton_gemm_alpha_beta(A, B, C=None, alpha=1.0, beta=0.0,
+                            BLOCK_M=64, BLOCK_N=64, BLOCK_K=32):
+    M, K = A.shape
+    K2, N = B.shape
+    assert K == K2, "Inner dimensions must match"
+    if C is None:
+        C = torch.zeros((M, N), device=A.device, dtype=A.dtype)
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     gemm_kernel[grid](
-        a, b, c,
+        A, B, C,
         M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1), 
-        c.stride(0), c.stride(1),
-        BLOCK_SIZE_M=32,
-        BLOCK_SIZE_N=64, 
-        BLOCK_SIZE_K=16,
-        GROUP_SIZE_M=8
+        A.stride(0), A.stride(1),
+        B.stride(0), B.stride(1),
+        C.stride(0), C.stride(1),
+        alpha, beta,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K
     )
-    
-    return c
+    return C
 
+# -----------------------------
+# Quick self-check
+# -----------------------------
+def quick_check_alpha_beta():
+    print(">>> Running quick GEMM check...")
+    M, K, N = 64, 64, 64
+    alpha, beta = 1.2, 0.8
+    A = torch.randn((M, K), device=device, dtype=torch.float32)
+    B = torch.randn((K, N), device=device, dtype=torch.float32)
+    C = torch.randn((M, N), device=device, dtype=torch.float32)
+    C_out = triton_gemm_alpha_beta(A, B, C.clone(), alpha=alpha, beta=beta)
+    C_ref = torch.addmm(beta*C, A, B, alpha=alpha)
+    max_diff = (C_out - C_ref).abs().max()
+    print(f"Quick check max difference: {max_diff.item():.3e}")
+    assert max_diff < 1e-5
 
-def test_gemm():
-    """Test GEMM against PyTorch implementation"""
-    torch.manual_seed(42)
-    
-    # Test parameters
-    M, K, N = 256, 512, 128
-    
-    # Create test data
-    a = torch.randn(M, K, dtype=torch.float32, device=device)
-    b = torch.randn(K, N, dtype=torch.float32, device=device)
-    
-    # Triton implementation
-    c_triton = gemm(a, b)
-    
-    # PyTorch reference implementation
-    c_torch = torch.matmul(a, b)
-    
-    # Compare results
-    torch.testing.assert_close(c_triton, c_torch, atol=1e-2, rtol=1e-2)
-    print(f"GEMM test passed! Max diff: {torch.max(torch.abs(c_triton - c_torch)):.6f}")
+# -----------------------------
+# CLI Quick benchmark
+# -----------------------------
+def run_cli_benchmark():
+    print(">>> Running CLI benchmark (if CUDA available, will time)")
+    quick_check_alpha_beta()
+    if torch.cuda.is_available():
+        M, K, N = 512, 512, 512
+        A = torch.randn((M, K), device='cuda', dtype=torch.float32)
+        B = torch.randn((K, N), device='cuda', dtype=torch.float32)
+        C_old = torch.randn((M, N), device='cuda', dtype=torch.float32)
+        alpha, beta = 1.0, 1.0
 
+        # warmup
+        _ = triton_gemm_alpha_beta(A, B, C=C_old.clone(),
+                                   alpha=alpha, beta=beta,
+                                   BLOCK_M=64, BLOCK_N=64, BLOCK_K=32)
+        torch.cuda.synchronize()
 
-@pytest.mark.parametrize("M, K, N", [
-    (64, 128, 64),
-    (128, 256, 128),
-    (256, 512, 256),
-])  
-def test_gemm_parametrized(M, K, N):
-    """Parametrized test for GEMM with different sizes"""
-    torch.manual_seed(42)
-    
-    a = torch.randn(M, K, dtype=torch.float32, device=device)
-    b = torch.randn(K, N, dtype=torch.float32, device=device)
-    
-    c_triton = gemm(a, b)
-    c_torch = torch.matmul(a, b)
-    
-    torch.testing.assert_close(c_triton, c_torch, atol=1e-2, rtol=1e-2)
+        t0 = time.perf_counter()
+        for _ in range(3):
+            _ = triton_gemm_alpha_beta(A, B, C=C_old.clone(),
+                                       alpha=alpha, beta=beta,
+                                       BLOCK_M=64, BLOCK_N=64, BLOCK_K=32)
+        torch.cuda.synchronize()
+        t_triton = (time.perf_counter() - t0)/3
 
+        # torch timing
+        t0 = time.perf_counter()
+        for _ in range(3):
+            _ = alpha*(A@B) + beta*C_old
+        torch.cuda.synchronize()
+        t_torch = (time.perf_counter() - t0)/3
 
-@benchmark.measure()
-def bench_gemm(M, K, N, provider):
-    """Benchmark GEMM"""
-    torch.manual_seed(42)
-    a = torch.randn(M, K, dtype=torch.float32, device=device)
-    b = torch.randn(K, N, dtype=torch.float32, device=device)
-    
-    if provider == 'triton':
-        gemm(a, b)
-    elif provider == 'torch':
-        torch.matmul(a, b)
+        print(f"512^3 | triton: {t_triton*1000:.3f} ms | torch: {t_torch*1000:.3f} ms")
+    else:
+        print("CUDA not available — skipping high-res GPU benchmark.")
 
+# -----------------------------
+# pytest correctness test
+# -----------------------------
+def test_triton_gemm_correctness():
+    M, K, N = 64, 64, 64
+    alpha, beta = 1.1, 0.9
+    A = torch.randn((M, K), device=device, dtype=torch.float32)
+    B = torch.randn((K, N), device=device, dtype=torch.float32)
+    C = torch.randn((M, N), device=device, dtype=torch.float32)
+    C_out = triton_gemm_alpha_beta(A, B, C.clone(), alpha=alpha, beta=beta)
+    C_ref = torch.addmm(beta*C, A, B, alpha=alpha)
+    max_diff = (C_out - C_ref).abs().max()
+    print(f"[pytest] max difference: {max_diff.item():.3e}")
+    assert max_diff < 1e-5
 
+# -----------------------------
+# Main entry
+# -----------------------------
 if __name__ == "__main__":
-    # Run tests
-    print("Running GEMM test...")  
-    test_gemm()
-    
-    # Run benchmarks
-    print("\n" + "="*50)
-    print("Running benchmarks...")
-    
-    benchmark.select_cpu_backend()
-    
-    # GEMM benchmarks
-    print("\nGEMM benchmarks:")
-    for M, K, N in [(256, 512, 256), (512, 1024, 512)]:
-        for provider in ['torch', 'triton']:
-            bench_gemm(M, K, N, provider)
+    print("ENTRY __main__")
+    print(f"MLIR dump enabled: {os.environ.get('MLIR_ENABLE_DUMP')}")
+    print(f"MLIR dump path: {os.environ.get('MLIR_DUMP_PATH')}")
+    run_cli_benchmark()
